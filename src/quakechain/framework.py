@@ -7,7 +7,7 @@ import json
 from lxml import html as _lh
 
 from .config import SPEC
-from .store import Store
+from .store import Store, canonical_content
 
 
 # --------------------------------------------------------------------------- #
@@ -17,7 +17,6 @@ class Transport:
     """Client for the bundled local service."""
 
     def __init__(self):
-        import os
         import sys
         for p in (str(SPEC_ROOT()), str(SPEC_ROOT() / "src")):
             if p not in sys.path:
@@ -79,6 +78,13 @@ class Http:
 # --------------------------------------------------------------------------- #
 # Response parsing.
 # --------------------------------------------------------------------------- #
+# Non-column fields the source may attach to a revision for provenance.
+_EXTRA_FIELDS = ("revision_no", "revision", "rev", "version", "revision_reason",
+                 "basis", "reason", "revised_at", "revision_time", "updated_at",
+                 "update_time", "source_id", "source", "feed",
+                 "event_time", "occurred_at")
+
+
 def _coerce(name, val):
     if name in SPEC.int_fields:
         try:
@@ -92,7 +98,15 @@ def parse(resp_body, fmt):
     cols = SPEC.columns
     if fmt == "json":
         items = json.loads(resp_body).get("items", [])
-        return [{c: _coerce(c, it.get(c)) for c in cols} for it in items]
+        rows = []
+        for it in items:
+            row = {c: _coerce(c, it.get(c)) for c in cols}
+            # Optional revision evidence travels alongside the source columns.
+            for key in _EXTRA_FIELDS:
+                if key in it and key not in row:
+                    row[key] = it[key]
+            rows.append(row)
+        return rows
     if fmt == "html":
         doc = _lh.fromstring(resp_body)
         rows = []
@@ -115,14 +129,25 @@ def parse(resp_body, fmt):
     raise ValueError("unknown fmt: %s" % fmt)
 
 
+class FetchError(RuntimeError):
+    """Raised when a page cannot be retrieved; nothing has been written."""
+
+
 def fetch_all(http: Http):
-    """Collect records from the local source."""
+    """Collect records from the local source.
+
+    Pages are read until an under-full page is seen.  Any non-200 page (after
+    bounded retries) aborts the whole collection with :class:`FetchError`, so a
+    transient cross-page failure never yields a truncated snapshot.  Identical
+    pages are still returned as-is; content identity in the store makes them
+    harmless and keeps duplicate accounts visible to callers.
+    """
     records, attempts, page = [], 0, 1
     while True:
         status, _hdr, body, att = http.get("/" + SPEC.endpoint, params={"page": page})
         attempts += att + 1
         if status != 200:
-            raise RuntimeError("fetch failed status=%s page=%s" % (status, page))
+            raise FetchError("fetch failed status=%s page=%s" % (status, page))
         page_recs = parse(body, SPEC.fmt)
         records.extend(page_recs)
         if len(page_recs) < SPEC.page_size:
@@ -137,10 +162,15 @@ def fetch_all(http: Http):
 # Record identity helpers.
 # --------------------------------------------------------------------------- #
 def canonical(d):
-    return json.dumps(d, sort_keys=True, ensure_ascii=False)
+    return json.dumps(canonical_content(d), sort_keys=True, ensure_ascii=False)
 
 
 def content_hash(d):
+    """Content identity, ignoring processing-derived fields.
+
+    Matches :meth:`Store.hash` so deduplication during fetch and revision
+    identity in storage always agree.
+    """
     return hashlib.sha256(canonical(d).encode()).hexdigest()[:24]
 
 
@@ -176,6 +206,47 @@ def _apply_kernel(records):
 # --------------------------------------------------------------------------- #
 # Collection pipeline.
 # --------------------------------------------------------------------------- #
+def _ingest(store, records, *, mode="full", source_id=None):
+    """Normalize, dedupe and append one fetched batch atomically.
+
+    A single reception timestamp is reserved for the whole batch, so the
+    transaction-time view can reconstruct exactly what one delivery contained.
+    The event-time watermark is only ever advanced; it is never used to discard
+    unseen content, because a late revision legitimately carries an older
+    event time and must still be recorded.
+    """
+    norm = [normalize(dict(r)) for r in records]
+    norm, dup_in_batch = dedup(norm)
+    norm = _apply_kernel(norm)
+
+    # Only consume a reception timestamp when the delivery actually adds
+    # revisions.  A no-op re-run then leaves the logical clock untouched, so
+    # later continuations receive the same timestamps as if the redundant run
+    # had never happened.
+    pending = [r for r in norm if not store.is_known(r)]
+    ingested = 0
+    if pending:
+        received = store.allocate_receive_time()
+        with store.batch():
+            for r in pending:
+                if store.upsert(r, source_id=source_id, receive_time=received):
+                    ingested += 1
+    else:
+        received = store.latest_receive_time()
+
+    # The event-time watermark is a progress marker and only ever moves
+    # forward, so a late revision carrying an older event time cannot make it
+    # regress.  It is never used to filter records.
+    observed = [str(r.get("ts", "")) for r in norm if str(r.get("ts", ""))]
+    current = store.watermark()
+    candidates = observed + ([current] if current else [])
+    if candidates:
+        advanced = max(candidates)
+        if advanced != current:
+            store.set_watermark(advanced)
+    return norm, dup_in_batch, ingested, received
+
+
 def run(mode="full", con=None):
     own = con is None
     con = con or Store().connect()
@@ -183,24 +254,26 @@ def run(mode="full", con=None):
     sleeper = Sleeper()
     http = Http(Transport(), sleeper)
     try:
+        # fetch_all only returns once every page succeeded.  A failure on any
+        # page aborts the whole run before anything is written, so a partial
+        # delivery can never be mistaken for a complete snapshot.
+        #
+        # ``incremental`` is kept as a compatibility alias.  It performs the
+        # same fetch and relies on content identity for idempotency instead of
+        # filtering on the event-time watermark: a late revision may carry an
+        # older event time and must still be recorded.
         records, attempts = fetch_all(http)
-        norm = [normalize(dict(r)) for r in records]
-        norm, dup_in_batch = dedup(norm)
-        norm = _apply_kernel(norm)
+        norm, dup_in_batch, ingested, received = _ingest(
+            store, records, mode=mode)
 
-        wm = store.watermark()
-        if mode == "incremental" and wm:
-            norm = [r for r in norm if str(r.get("ts", "")) > wm]
-
-        ingested = sum(1 for r in norm if store.upsert(r))
         total = store.count()
-        new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
-        if new_wm:
-            store.set_watermark(new_wm)
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
                 "duplicates": dup_in_batch, "ingested": ingested, "count": total,
                 "http_attempts": attempts, "slept": round(sleeper.slept, 4),
-                "watermark": store.watermark()}
+                "watermark": store.watermark(), "receive_time": received,
+                "events": store.event_count(), "revisions": total,
+                "schema_version": store.schema_version(),
+                "rule_version": store.rule_version()}
     finally:
         if own:
             con.close()
@@ -264,6 +337,8 @@ class Rpa:
         return ok
 
     def submit(self, record):
+        # The token identifies the revision content, not the processing state,
+        # so re-submitting an unchanged revision stays a server-side dedup.
         token = content_hash(record)
         status, _h, body = self.t.request("POST", "/submit",
                                           json_body={"token": token, "record": record},
@@ -281,10 +356,7 @@ def run_rpa(con=None):
     try:
         logged = r.login()
         items = r.collect()
-        norm = [normalize(dict(it)) for it in items]
-        norm, dup = dedup(norm)
-        norm = _apply_kernel(norm)
-        ingested = sum(1 for x in norm if store.upsert(x))
+        norm, dup, ingested, received = _ingest(store, items)
         total = store.count()
         created = dedup_submit = 0
         for x in norm[:2]:
@@ -295,12 +367,10 @@ def run_rpa(con=None):
         for x in norm[:1]:
             if not r.submit(x):
                 dedup_submit += 1
-        wm = max([str(x.get("ts", "")) for x in norm] + [""])
-        if wm:
-            store.set_watermark(wm)
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
-                "ingested": ingested, "count": total,
+                "ingested": ingested, "count": total, "events": store.event_count(),
+                "revisions": total, "receive_time": received,
                 "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
     finally:
         if own:
